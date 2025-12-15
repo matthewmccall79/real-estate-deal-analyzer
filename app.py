@@ -2,7 +2,10 @@ import sqlite3
 from math import pow
 import streamlit as st
 
-DB = "realestate.db"
+import os
+
+DB = os.path.join(os.path.dirname(__file__), "realestate.db")
+
 
 def monthly_payment(principal, annual_rate, years):
     if principal <= 0:
@@ -79,3 +82,4 @@ st.subheader("Results")
 st.metric("Cash Flow (Monthly)", f"${cash_flow_monthly:,.2f}")
 st.metric("Cash-on-Cash Return", f"{coc:.2f}%")
 st.metric("Cap Rate", f"{cap_rate:.2f}%")
+
