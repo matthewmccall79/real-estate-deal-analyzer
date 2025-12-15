@@ -1,5 +1,20 @@
 # Real Estate Deal QuickCheck
 
+Live demo: https://real-estate-deal-analyzer.streamlit.app
+
+A lightweight real estate underwriting tool built for small residential investors and Realtors to quickly decide whether a deal is worth pursuing.
+
+## Key features
+- Fast underwriting with sensible defaults (cash flow, cap rate, cash-on-cash)
+- Save deal analyses for later review
+- Compare two saved deals side-by-side
+- Export a deal summary (CSV)
+
+## Tech stack
+Python • SQLite • Streamlit • Pandas
+
+# Real Estate Deal QuickCheck
+
 A lightweight real estate underwriting tool built for small residential investors and Realtors who need to quickly determine whether a deal is worth pursuing.
 
 Deal QuickCheck allows users to input basic purchase, rent, and financing assumptions and instantly see key investment metrics such as monthly cash flow, cap rate, and cash-on-cash return. Each analysis can be saved and compared side-by-side to support faster, more confident decision-making.
@@ -34,6 +49,7 @@ financing and operating assumptions and instantly see the impact on:
 
 ![Streamlit UI Demo](UI_Screenshot_(2))
 ## Dashboard
+Screenshots of the Streamlit UI showing QuickCheck, Saved Deals, and Compare views.
 
 ### QuickCheck
 ![QuickCheck](dashboard_quickcheck.png)
@@ -43,4 +59,5 @@ financing and operating assumptions and instantly see the impact on:
 
 ### Compare Deals
 ![Compare Deals](dashboard_compare_deals.png)
+
 
