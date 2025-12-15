@@ -45,9 +45,9 @@ financing and operating assumptions and instantly see the impact on:
 - Cash-on-cash return
 - Cap rate
 
-![Streamlit UI Demo](UI_Screenshot_(1))
+![Streamlit UI Demo](UI_Screenshot_(1).png)
 
-![Streamlit UI Demo](UI_Screenshot_(2))
+![Streamlit UI Demo](UI_Screenshot_(2).png)
 ## Dashboard
 Screenshots of the Streamlit UI showing QuickCheck, Saved Deals, and Compare views.
 
@@ -59,6 +59,7 @@ Screenshots of the Streamlit UI showing QuickCheck, Saved Deals, and Compare vie
 
 ### Compare Deals
 ![Compare Deals](compare_deals.png)
+
 
 
 
