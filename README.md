@@ -52,12 +52,13 @@ financing and operating assumptions and instantly see the impact on:
 Screenshots of the Streamlit UI showing QuickCheck, Saved Deals, and Compare views.
 
 ### QuickCheck
-![QuickCheck](dashboard_quickcheck.png)
+![QuickCheck](quickcheck.png)
 
 ### Saved Deals
-![Saved Deals](dashboard_saved_deals.png)
+![Saved Deals](saved_deals.png)
 
 ### Compare Deals
-![Compare Deals](dashboard_compare_deals.png)
+![Compare Deals](compare_deals.png)
+
 
 
