@@ -1,102 +1,59 @@
 import os
+import json
 import sqlite3
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
 
-import streamlit as st
 import requests
+import streamlit as st
+import pandas as pd
+
+# Local modules you created in Steps 4.A–4.C
+from attom_client import lookup_property_by_address
+from db_ops import upsert_property_fact, insert_deal_input, list_saved_deals, get_deal_by_id
+
+# Optional: ensure schema is present (safe to run repeatedly)
+try:
+    from db_schema import ensure_columns
+    ensure_columns()
+except Exception:
+    # If db_schema isn't available or fails, app can still run;
+    # you already ran schema alignment manually.
+    pass
+
+
+DB_FILE = os.path.join(os.path.dirname(__file__), "realestate.db")
 
 
 # =========================
-# CONFIG
+# Helpers: API key bridging
 # =========================
-st.set_page_config(page_title="Real Estate Deal Analyzer", layout="centered")
-DB = os.path.join(os.path.dirname(__file__), "realestate.db")
-
-
-# =========================
-# FINANCE HELPERS
-# =========================
-def monthly_payment(principal: float, annual_rate: float, years: int) -> float:
-    if principal <= 0:
-        return 0.0
-    r = annual_rate / 12
-    n = years * 12
-    if r == 0:
-        return principal / n
-    return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
-
-
-def compute_metrics(
-    purchase_price: float,
-    rent_monthly: float,
-    sqft: float | None,
-    down_pct: float,
-    interest_rate: float,
-    term_years: int,
-    opex_ratio: float,
-    monthly_taxes: float,
-    monthly_insurance: float,
-    monthly_hoa: float,
-    monthly_maintenance: float,
-):
-    loan_amount = purchase_price * (1 - down_pct)
-    mortgage_pmt = monthly_payment(loan_amount, interest_rate, term_years)
-
-    gross_rent_annual = rent_monthly * 12
-    noi_annual = gross_rent_annual * (1 - opex_ratio)
-
-    fixed_costs_annual = 12 * (
-        monthly_taxes + monthly_insurance + monthly_hoa + monthly_maintenance
-    )
-
-    cash_flow_annual = noi_annual - (mortgage_pmt * 12) - fixed_costs_annual
-    cash_flow_monthly = cash_flow_annual / 12
-    cash_invested = purchase_price * down_pct
-
-    cap_rate = (noi_annual / purchase_price) * 100 if purchase_price else 0.0
-    coc_return = (cash_flow_annual / cash_invested) * 100 if cash_invested else 0.0
-    price_per_sqft = (purchase_price / sqft) if sqft and sqft > 0 else None
-
-    return {
-        "mortgage_pmt": mortgage_pmt,
-        "gross_rent_annual": gross_rent_annual,
-        "noi_annual": noi_annual,
-        "fixed_costs_annual": fixed_costs_annual,
-        "cash_flow_monthly": cash_flow_monthly,
-        "cash_flow_annual": cash_flow_annual,
-        "cap_rate": cap_rate,
-        "coc_return": coc_return,
-        "cash_invested": cash_invested,
-        "price_per_sqft": price_per_sqft,
-    }
-
-
-# =========================
-# API HELPERS
-# =========================
-def get_attom_key():
+def ensure_attom_key_available():
+    """
+    Your attom_client reads ATTOM_API_KEY from environment variables.
+    Streamlit Cloud provides secrets via st.secrets.
+    This bridges st.secrets -> os.environ when needed.
+    """
+    if os.getenv("ATTOM_API_KEY"):
+        return
     try:
-        return st.secrets.get("ATTOM_API_KEY", None)
+        key = st.secrets.get("ATTOM_API_KEY")
+        if key:
+            os.environ["ATTOM_API_KEY"] = str(key)
     except Exception:
-        return os.getenv("ATTOM_API_KEY")
+        pass
 
 
-def nominatim_suggest(query: str, limit: int = 6):
-    """
-    Autocomplete suggestions via OpenStreetMap Nominatim.
-    Returns display_name strings.
-    """
+# =========================
+# Helpers: autocomplete
+# =========================
+def nominatim_suggest(query: str, limit: int = 6) -> List[str]:
     q = (query or "").strip()
     if len(q) < 4:
         return []
 
     url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": q,
-        "format": "json",
-        "addressdetails": 0,
-        "limit": str(limit),
-    }
+    params = {"q": q, "format": "json", "addressdetails": 0, "limit": str(limit)}
     headers = {"User-Agent": "real-estate-deal-analyzer/1.0"}
 
     try:
@@ -113,331 +70,308 @@ def nominatim_suggest(query: str, limit: int = 6):
         return []
 
 
-def attom_lookup_by_address(address_one_line: str):
-    """
-    ATTOM basic profile lookup by a single address string.
-    Returns {'address_one_line':..., 'sqft':...} or {'error':...}.
-    """
-    api_key = get_attom_key()
-    if not api_key:
-        return {"error": "Missing ATTOM_API_KEY in Streamlit Secrets."}
-
-    url = "https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile"
-    headers = {"apikey": api_key, "Accept": "application/json"}
-    params = {"address": address_one_line}
-
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=12)
-        if r.status_code != 200:
-            return {"error": f"ATTOM returned {r.status_code}: {r.text[:200]}"}
-
-        data = r.json()
-
-        props = data.get("property")
-        p = props[0] if isinstance(props, list) and props else (props if isinstance(props, dict) else None)
-        if not p:
-            return {"error": "No property found for that address."}
-
-        addr = p.get("address", {}) or {}
-        building = p.get("building", {}) or {}
-        size = (building.get("size") or {}) if isinstance(building, dict) else {}
-
-        sqft = size.get("livingsize") or size.get("bldgsize") or size.get("grosssize")
-        one_line = addr.get("oneLine") or address_one_line
-
-        return {
-            "address_one_line": one_line,
-            "sqft": float(sqft) if sqft is not None else None,
-        }
-    except Exception as e:
-        return {"error": f"ATTOM lookup failed: {e}"}
-
-
 # =========================
-# DB HELPERS
+# Finance
 # =========================
-def get_conn():
-    return sqlite3.connect(DB, check_same_thread=False)
+def monthly_payment(principal: float, annual_rate: float, years: int) -> float:
+    if principal <= 0:
+        return 0.0
+    r = annual_rate / 12
+    n = years * 12
+    if r == 0:
+        return principal / n
+    return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
 
 
-def create_saved_deals_table():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS saved_deals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            label TEXT,
-            notes TEXT,
+@dataclass
+class Inputs:
+    address: str
+    sqft: Optional[float]
+    purchase_price: float
+    rent_monthly: float
 
-            address TEXT NOT NULL,
-            sqft REAL,
+    down_pct: float
+    interest_rate: float
+    term_years: int
 
-            purchase_price REAL NOT NULL,
-            rent_monthly REAL NOT NULL,
+    vacancy_pct: float
+    mgmt_pct: float
+    opex_pct: float
 
-            down_pct REAL NOT NULL,
-            interest_rate REAL NOT NULL,
-            term_years INTEGER NOT NULL,
-            opex_ratio REAL NOT NULL,
+    taxes_monthly: float
+    insurance_monthly: float
+    hoa_monthly: float
+    maintenance_monthly: float
+    other_monthly: float
 
-            monthly_taxes REAL NOT NULL,
-            monthly_insurance REAL NOT NULL,
-            monthly_hoa REAL NOT NULL,
-            monthly_maintenance REAL NOT NULL
-        )
-        """
+    reserves_monthly: float
+    capex_monthly: float
+
+    closing_cost_pct: float
+    lender_points_pct: float
+
+
+def underwrite(x: Inputs) -> Dict[str, float]:
+    loan = x.purchase_price * (1 - x.down_pct)
+    pmt = monthly_payment(loan, x.interest_rate, x.term_years)
+
+    gross_annual = x.rent_monthly * 12
+    vacancy_loss = gross_annual * x.vacancy_pct
+    effective_gross = gross_annual - vacancy_loss
+
+    mgmt_cost = effective_gross * x.mgmt_pct
+    base_opex = effective_gross * x.opex_pct
+
+    fixed_annual = 12 * (
+        x.taxes_monthly
+        + x.insurance_monthly
+        + x.hoa_monthly
+        + x.maintenance_monthly
+        + x.other_monthly
+        + x.reserves_monthly
+        + x.capex_monthly
     )
-    conn.commit()
-    conn.close()
+
+    opex_total = mgmt_cost + base_opex + fixed_annual
+    noi = effective_gross - opex_total
+
+    debt_annual = pmt * 12
+    cash_flow_annual = noi - debt_annual
+    cash_flow_monthly = cash_flow_annual / 12
+
+    cash_down = x.purchase_price * x.down_pct
+    closing_costs = x.purchase_price * x.closing_cost_pct
+    points_cost = loan * x.lender_points_pct
+    cash_invested_total = cash_down + closing_costs + points_cost
+
+    cap_rate = (noi / x.purchase_price * 100) if x.purchase_price else 0.0
+    coc = (cash_flow_annual / cash_invested_total * 100) if cash_invested_total else 0.0
+    ppsf = (x.purchase_price / x.sqft) if x.sqft and x.sqft > 0 else 0.0
+
+    # Breakeven rent (rough): solve CF = 0
+    breakeven_rent_monthly = 0.0
+    denom = 12 * (1 - x.vacancy_pct) * (1 - (x.mgmt_pct + x.opex_pct))
+    if denom > 0:
+        breakeven_rent_monthly = (fixed_annual + debt_annual) / denom
+
+    return {
+        "loan_amount": loan,
+        "mortgage_pmt_monthly": pmt,
+        "gross_rent_annual": gross_annual,
+        "effective_gross_annual": effective_gross,
+        "operating_expenses_annual": opex_total,
+        "noi_annual": noi,
+        "debt_service_annual": debt_annual,
+        "cash_flow_monthly": cash_flow_monthly,
+        "cash_flow_annual": cash_flow_annual,
+        "cap_rate_pct": cap_rate,
+        "coc_return_pct": coc,
+        "cash_invested_total": cash_invested_total,
+        "price_per_sqft": ppsf,
+        "breakeven_rent_monthly": breakeven_rent_monthly,
+    }
 
 
-def insert_saved_deal(payload: dict):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO saved_deals (
-            created_at, label, notes,
-            address, sqft,
-            purchase_price, rent_monthly,
-            down_pct, interest_rate, term_years, opex_ratio,
-            monthly_taxes, monthly_insurance, monthly_hoa, monthly_maintenance
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload["created_at"],
-            payload.get("label"),
-            payload.get("notes"),
-            payload["address"],
-            payload.get("sqft"),
-            payload["purchase_price"],
-            payload["rent_monthly"],
-            payload["down_pct"],
-            payload["interest_rate"],
-            payload["term_years"],
-            payload["opex_ratio"],
-            payload["monthly_taxes"],
-            payload["monthly_insurance"],
-            payload["monthly_hoa"],
-            payload["monthly_maintenance"],
-        ),
-    )
-    conn.commit()
-    conn.close()
+def score_badge(metrics: Dict[str, float]) -> str:
+    cf = metrics["cash_flow_monthly"]
+    coc = metrics["coc_return_pct"]
+    cap = metrics["cap_rate_pct"]
 
-
-def load_saved_deals():
-    conn = get_conn()
-    cur = conn.cursor()
-    rows = cur.execute(
-        """
-        SELECT id, created_at, COALESCE(label,''), address, sqft, purchase_price, rent_monthly
-        FROM saved_deals
-        ORDER BY id DESC
-        """
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def get_saved_deal(deal_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    row = cur.execute(
-        """
-        SELECT
-            id, created_at, label, notes,
-            address, sqft,
-            purchase_price, rent_monthly,
-            down_pct, interest_rate, term_years, opex_ratio,
-            monthly_taxes, monthly_insurance, monthly_hoa, monthly_maintenance
-        FROM saved_deals
-        WHERE id = ?
-        """,
-        (deal_id,),
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def delete_saved_deal(deal_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM saved_deals WHERE id = ?", (deal_id,))
-    conn.commit()
-    conn.close()
-
-
-def load_latest_deal_from_existing_tables():
-    """
-    Pulls your latest ingested deal from existing tables:
-    deal_inputs JOIN property_facts.
-    Used as sensible defaults.
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    row = cur.execute(
-        """
-        SELECT
-          pf.address,
-          pf.sqft,
-          di.purchase_price,
-          di.estimated_rent,
-          COALESCE(di.monthly_taxes, 0),
-          COALESCE(di.monthly_insurance, 0),
-          COALESCE(di.monthly_hoa, 0),
-          COALESCE(di.monthly_maintenance, 0)
-        FROM deal_inputs di
-        JOIN property_facts pf ON pf.id = di.property_fact_id
-        ORDER BY di.id DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    conn.close()
-    return row
+    if cf >= 250 and coc >= 8 and cap >= 6:
+        return "🟢 GREEN"
+    if cf >= 0 and coc >= 4 and cap >= 4.5:
+        return "🟡 YELLOW"
+    return "🔴 RED"
 
 
 # =========================
-# APP UI
+# UI
 # =========================
+st.set_page_config(page_title="Real Estate Deal Analyzer", layout="wide")
 st.title("🏠 Real Estate Deal Analyzer")
-st.caption("Paste an address → autocomplete → lookup sqft → underwrite → save → compare")
+st.caption("Autocomplete address → ATTOM lookup (sqft) → Underwrite → Save → Compare")
 
-create_saved_deals_table()
+ensure_attom_key_available()
 
-tabs = st.tabs(["QuickCheck", "Saved Deals", "Compare Deals"])
-tab1, tab2, tab3 = tabs
+tab1, tab2, tab3 = st.tabs(["QuickCheck", "Saved Deals", "Compare Deals"])
 
-latest = load_latest_deal_from_existing_tables()
-if not latest:
-    st.error("No deal data found in your database yet. Run your extract/save pipeline first.")
-    st.stop()
-
-db_address, db_sqft, db_price, db_rent, db_tax, db_ins, db_hoa, db_maint = latest
-db_sqft = float(db_sqft) if db_sqft is not None else None
+# Session defaults
+if "loaded_deal" not in st.session_state:
+    st.session_state["loaded_deal"] = None
+if "lookup_result" not in st.session_state:
+    st.session_state["lookup_result"] = {}
 
 
 # ==========================================================
-# TAB 1 — QUICKCHECK + LOOKUP + SAVE
+# TAB 1 — QUICKCHECK
 # ==========================================================
 with tab1:
-    st.subheader("1) Property (Address Search + Lookup)")
+    st.subheader("1) Property Lookup")
 
-    if "lookup_result" not in st.session_state:
-        st.session_state["lookup_result"] = {}
+    loaded = st.session_state.get("loaded_deal")
+    default_address = loaded["address"] if loaded else ""
+    default_sqft = float(loaded["sqft"] or 0.0) if loaded else 0.0
+    default_price = float(loaded["purchase_price"] or 900000) if loaded else 900000.0
+    default_rent = float(loaded["estimated_rent"] or 6000) if loaded else 6000.0
+    default_tax = float(loaded["monthly_taxes"] or 0) if loaded else 0.0
+    default_ins = float(loaded["monthly_insurance"] or 0) if loaded else 0.0
+    default_hoa = float(loaded["monthly_hoa"] or 0) if loaded else 0.0
+    default_maint = float(loaded["monthly_maintenance"] or 0) if loaded else 0.0
+    default_notes = loaded.get("notes", "") if loaded else ""
 
-    search_q = st.text_input("Search address", value=db_address)
-    suggestions = nominatim_suggest(search_q)
+    typed = st.text_input("Search address", value=default_address)
+    suggestions = nominatim_suggest(typed)
     picked = st.selectbox("Suggestions (optional)", ["(use typed address)"] + suggestions)
-
-    lookup_address = search_q if picked == "(use typed address)" else picked
+    lookup_address = typed if picked == "(use typed address)" else picked
 
     colL, colR = st.columns([1, 2])
     with colL:
-        do_lookup = st.button("🔎 Lookup (auto-fill sqft)")
+        do_lookup = st.button("🔎 Lookup (ATTOM auto-fill sqft)")
     with colR:
-        st.caption("Uses ATTOM to auto-fill sqft when possible. You can still override manually.")
+        st.caption("If ATTOM fails, you can still enter sqft manually.")
 
     if do_lookup:
-        res = attom_lookup_by_address(lookup_address)
-        st.session_state["lookup_result"] = res
-        if res.get("error"):
-            st.error(res["error"])
-        else:
-            st.success("Lookup success — sqft will be pre-filled below.")
+        try:
+            p = lookup_property_by_address(lookup_address)
+            if not p:
+                st.session_state["lookup_result"] = {"error": "No property found for that address."}
+            else:
+                addr = (p.get("address") or {}).get("oneLine") or lookup_address
+                b = p.get("building") or {}
+                size = (b.get("size") or {}) if isinstance(b, dict) else {}
+                sqft_val = size.get("livingsize") or size.get("bldgsize") or size.get("grosssize")
 
-    lookup = st.session_state.get("lookup_result", {}) or {}
-    display_address = lookup.get("address_one_line") or lookup_address
+                st.session_state["lookup_result"] = {
+                    "address": addr,
+                    "sqft": float(sqft_val) if sqft_val is not None else None,
+                    "raw_property": p,
+                }
+        except Exception as e:
+            st.session_state["lookup_result"] = {"error": str(e)}
 
-    sqft_default = lookup.get("sqft")
+    res = st.session_state.get("lookup_result", {}) or {}
+    if res.get("error"):
+        st.error(res["error"])
+
+    display_address = (res.get("address") or lookup_address or default_address).strip()
+    sqft_default = res.get("sqft")
     if sqft_default is None:
-        sqft_default = db_sqft if db_sqft is not None else 0.0
+        sqft_default = default_sqft
 
-    st.write(f"**Using address:** {display_address}")
-    st.write(f"**Sqft default:** {sqft_default if sqft_default else 'Unknown'}")
+    st.write(f"**Using address:** {display_address or '—'}")
 
-    st.subheader("2) Underwrite (Adjust Inputs)")
+    st.divider()
+    st.subheader("2) Underwrite")
 
     with st.form("quickcheck_form"):
-        col1, col2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
 
-        with col1:
-            purchase_price = st.number_input("Purchase price ($)", min_value=0.0, value=float(db_price))
-            rent_monthly = st.number_input("Estimated rent (monthly $)", min_value=0.0, value=float(db_rent))
-            sqft_input = st.number_input("Sqft (optional override)", min_value=0.0, value=float(sqft_default or 0.0))
-
-            down_pct = st.slider("Down payment (%)", 5, 40, 20) / 100
-            interest_rate = st.slider("Interest rate (%)", 3.0, 10.0, 7.0) / 100
-            term_years = st.selectbox("Loan term (years)", [15, 30], index=1)
-
-        with col2:
-            opex_ratio = st.slider("Operating expense ratio (%)", 20, 50, 35) / 100
-
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                monthly_taxes = st.number_input("Taxes ($/mo)", min_value=0.0, value=float(db_tax))
-            with c2:
-                monthly_insurance = st.number_input("Insurance ($/mo)", min_value=0.0, value=float(db_ins))
-            with c3:
-                monthly_hoa = st.number_input("HOA ($/mo)", min_value=0.0, value=float(db_hoa))
-            with c4:
-                monthly_maintenance = st.number_input("Maintenance ($/mo)", min_value=0.0, value=float(db_maint))
+        with c1:
+            purchase_price = st.number_input("Purchase price ($)", min_value=0.0, value=float(default_price))
+            rent_monthly = st.number_input("Rent (monthly $)", min_value=0.0, value=float(default_rent))
+            sqft_input = st.number_input("Sqft (override)", min_value=0.0, value=float(sqft_default or 0.0))
 
             label = st.text_input("Label (optional)", value="")
-            notes = st.text_area("Notes (optional)", value="", height=90)
+            notes = st.text_area("Notes (optional)", value=default_notes, height=80)
+
+        with c2:
+            down_pct = st.slider("Down payment (%)", 5, 40, 20) / 100
+            interest_rate = st.slider("Interest rate (%)", 3.0, 12.0, 7.0, 0.1) / 100
+            term_years = st.selectbox("Term (years)", [15, 30], index=1)
+
+            vacancy_pct = st.slider("Vacancy (%)", 0, 20, 5) / 100
+            mgmt_pct = st.slider("Property management (%)", 0, 20, 8) / 100
+            opex_pct = st.slider("Base OpEx ratio (%)", 10, 60, 35) / 100
+
+        with c3:
+            taxes_monthly = st.number_input("Taxes ($/mo)", min_value=0.0, value=float(default_tax))
+            insurance_monthly = st.number_input("Insurance ($/mo)", min_value=0.0, value=float(default_ins))
+            hoa_monthly = st.number_input("HOA ($/mo)", min_value=0.0, value=float(default_hoa))
+            maintenance_monthly = st.number_input("Maintenance ($/mo)", min_value=0.0, value=float(default_maint))
+            other_monthly = st.number_input("Other ($/mo)", min_value=0.0, value=0.0)
+
+            reserves_monthly = st.number_input("Reserves ($/mo)", min_value=0.0, value=150.0)
+            capex_monthly = st.number_input("CapEx estimate ($/mo)", min_value=0.0, value=150.0)
+
+            closing_cost_pct = st.slider("Closing costs (%)", 0.0, 6.0, 2.0, 0.1) / 100
+            lender_points_pct = st.slider("Lender points (%)", 0.0, 4.0, 1.0, 0.1) / 100
 
         run_clicked = st.form_submit_button("Run QuickCheck")
-        save_clicked = st.form_submit_button("Run QuickCheck + Save")
+        save_clicked = st.form_submit_button("Run + Save Deal")
 
     if run_clicked or save_clicked:
-        metrics = compute_metrics(
+        x = Inputs(
+            address=display_address,
+            sqft=float(sqft_input) if sqft_input and sqft_input > 0 else None,
             purchase_price=float(purchase_price),
             rent_monthly=float(rent_monthly),
-            sqft=float(sqft_input) if sqft_input and sqft_input > 0 else None,
+
             down_pct=float(down_pct),
             interest_rate=float(interest_rate),
             term_years=int(term_years),
-            opex_ratio=float(opex_ratio),
-            monthly_taxes=float(monthly_taxes),
-            monthly_insurance=float(monthly_insurance),
-            monthly_hoa=float(monthly_hoa),
-            monthly_maintenance=float(monthly_maintenance),
+
+            vacancy_pct=float(vacancy_pct),
+            mgmt_pct=float(mgmt_pct),
+            opex_pct=float(opex_pct),
+
+            taxes_monthly=float(taxes_monthly),
+            insurance_monthly=float(insurance_monthly),
+            hoa_monthly=float(hoa_monthly),
+            maintenance_monthly=float(maintenance_monthly),
+            other_monthly=float(other_monthly),
+
+            reserves_monthly=float(reserves_monthly),
+            capex_monthly=float(capex_monthly),
+
+            closing_cost_pct=float(closing_cost_pct),
+            lender_points_pct=float(lender_points_pct),
         )
 
+        m = underwrite(x)
         st.subheader("3) Results")
-        a, b, c = st.columns(3)
-        a.metric("Monthly Cash Flow", f"${metrics['cash_flow_monthly']:,.2f}")
-        b.metric("Cash-on-Cash Return", f"{metrics['coc_return']:.2f}%")
-        c.metric("Cap Rate", f"{metrics['cap_rate']:.2f}%")
+        st.write(score_badge(m))
 
-        a2, b2, c2 = st.columns(3)
-        a2.metric("Mortgage P&I (Monthly)", f"${metrics['mortgage_pmt']:,.2f}")
-        b2.metric("NOI (Annual)", f"${metrics['noi_annual']:,.2f}")
-        c2.metric("Price / Sqft", f"${metrics['price_per_sqft']:,.2f}" if metrics["price_per_sqft"] else "—")
+        a, b, c, d = st.columns(4)
+        a.metric("Monthly Cash Flow", f"${m['cash_flow_monthly']:,.2f}")
+        b.metric("Cash-on-Cash", f"{m['coc_return_pct']:.2f}%")
+        c.metric("Cap Rate", f"{m['cap_rate_pct']:.2f}%")
+        d.metric("Breakeven Rent", f"${m['breakeven_rent_monthly']:,.0f}/mo")
+
+        a2, b2, c2, d2 = st.columns(4)
+        a2.metric("Mortgage P&I", f"${m['mortgage_pmt_monthly']:,.2f}/mo")
+        b2.metric("NOI", f"${m['noi_annual']:,.0f}/yr")
+        c2.metric("Cash Invested", f"${m['cash_invested_total']:,.0f}")
+        d2.metric("Price/Sqft", f"${m['price_per_sqft']:,.2f}" if m["price_per_sqft"] else "—")
 
         if save_clicked:
-            insert_saved_deal(
-                {
-                    "created_at": datetime.utcnow().isoformat(),
-                    "label": (label.strip() or None),
-                    "notes": (notes.strip() or None),
-                    "address": display_address,
-                    "sqft": float(sqft_input) if sqft_input and sqft_input > 0 else None,
-                    "purchase_price": float(purchase_price),
-                    "rent_monthly": float(rent_monthly),
-                    "down_pct": float(down_pct),
-                    "interest_rate": float(interest_rate),
-                    "term_years": int(term_years),
-                    "opex_ratio": float(opex_ratio),
-                    "monthly_taxes": float(monthly_taxes),
-                    "monthly_insurance": float(monthly_insurance),
-                    "monthly_hoa": float(monthly_hoa),
-                    "monthly_maintenance": float(monthly_maintenance),
-                }
+            # Save property facts (raw) + address + sqft into property_facts
+            raw_property = res.get("raw_property")
+            json_raw = json.dumps({"property": [raw_property]} if raw_property else {"property": []})
+
+            conn = sqlite3.connect(DB_FILE)
+
+            pf_id = upsert_property_fact(
+                conn,
+                json_raw=json_raw,
+                address=display_address,
+                sqft=float(sqft_input) if sqft_input and sqft_input > 0 else None,
             )
-            st.success("✅ Deal saved! Check the Saved Deals tab.")
+
+            deal_id = insert_deal_input(
+                conn,
+                property_fact_id=pf_id,
+                purchase_price=float(purchase_price),
+                estimated_rent=float(rent_monthly),
+                monthly_taxes=float(taxes_monthly),
+                monthly_insurance=float(insurance_monthly),
+                monthly_hoa=float(hoa_monthly),
+                monthly_maintenance=float(maintenance_monthly),
+                label=(label.strip() if label else ""),
+                notes=(notes.strip() if notes else ""),
+            )
+
+            conn.close()
+            st.success(f"✅ Saved deal (ID {deal_id}). Go to the Saved Deals tab.")
 
 
 # ==========================================================
@@ -446,56 +380,29 @@ with tab1:
 with tab2:
     st.subheader("Saved Deals")
 
-    rows = load_saved_deals()
-    if not rows:
-        st.info("No saved deals yet. Use QuickCheck + Save to add one.")
+    saved = list_saved_deals(limit=100)
+    if not saved:
+        st.info("No saved deals yet. Use QuickCheck → Run + Save Deal.")
     else:
-        options = {}
-        for (deal_id, created_at, label, addr, sqft_r, pp, rentm) in rows:
-            tag = f"{deal_id} • {label or 'Untitled'} • {addr} • ${pp:,.0f} • ${rentm:,.0f}/mo"
-            options[tag] = deal_id
+        df = pd.DataFrame(saved)
+        st.dataframe(df, use_container_width=True)
 
-        selected_tag = st.selectbox("Select a saved deal", list(options.keys()))
-        selected_id = options[selected_tag]
+        st.divider()
+        st.subheader("Load a saved deal into QuickCheck")
 
-        deal = get_saved_deal(selected_id)
-        (
-            _id, created_at, label, notes,
-            addr, sqft_r,
-            pp, rentm,
-            down_pct, ir, term_y, opex_r,
-            mtax, mins, mhoa, mmaint
-        ) = deal
+        deal_ids = df["deal_id"].tolist()
+        selected_id = st.selectbox("Choose a deal_id", deal_ids)
 
-        st.write(f"**Address:** {addr}")
-        st.write(f"**Label:** {label or '—'}")
-        st.write(f"**Created:** {created_at}")
-        st.write(f"**Notes:** {notes or '—'}")
-
-        metrics = compute_metrics(
-            purchase_price=float(pp),
-            rent_monthly=float(rentm),
-            sqft=float(sqft_r) if sqft_r else None,
-            down_pct=float(down_pct),
-            interest_rate=float(ir),
-            term_years=int(term_y),
-            opex_ratio=float(opex_r),
-            monthly_taxes=float(mtax),
-            monthly_insurance=float(mins),
-            monthly_hoa=float(mhoa),
-            monthly_maintenance=float(mmaint),
-        )
-
-        st.subheader("Deal Metrics")
-        a, b, c = st.columns(3)
-        a.metric("Monthly Cash Flow", f"${metrics['cash_flow_monthly']:,.2f}")
-        b.metric("Cash-on-Cash Return", f"{metrics['coc_return']:.2f}%")
-        c.metric("Cap Rate", f"{metrics['cap_rate']:.2f}%")
-
-        if st.button("🗑️ Delete this saved deal"):
-            delete_saved_deal(selected_id)
-            st.success("Deleted. Refreshing…")
-            st.rerun()
+        if st.button("Load into QuickCheck"):
+            d = get_deal_by_id(int(selected_id))
+            if not d:
+                st.error("Could not load that deal.")
+            else:
+                st.session_state["loaded_deal"] = d
+                # Clear lookup result so defaults come from loaded deal
+                st.session_state["lookup_result"] = {}
+                st.success("Loaded. Switch to QuickCheck tab.")
+                st.rerun()
 
 
 # ==========================================================
@@ -504,59 +411,75 @@ with tab2:
 with tab3:
     st.subheader("Compare Deals")
 
-    rows = load_saved_deals()
-    if len(rows) < 2:
+    saved = list_saved_deals(limit=200)
+    if len(saved) < 2:
         st.info("Save at least 2 deals to compare them.")
     else:
-        items = []
-        id_by_label = {}
-        for (deal_id, created_at, label, addr, sqft_r, pp, rentm) in rows:
-            text = f"{deal_id} • {label or 'Untitled'} • {addr} • ${pp:,.0f}"
-            items.append(text)
-            id_by_label[text] = deal_id
+        df = pd.DataFrame(saved)
 
-        selected = st.multiselect("Pick 2+ deals to compare", items, default=items[:2])
+        # Choose deals
+        labels = []
+        id_map = {}
+        for _, row in df.iterrows():
+            tag = f"{int(row['deal_id'])} • {row.get('label','')} • {row.get('address','')[:60]} • ${float(row['purchase_price']):,.0f}"
+            labels.append(tag)
+            id_map[tag] = int(row["deal_id"])
+
+        selected = st.multiselect("Select 2+ deals", labels, default=labels[:2])
 
         if len(selected) >= 2:
             compare_rows = []
             for tag in selected:
-                deal_id = id_by_label[tag]
-                deal = get_saved_deal(deal_id)
-                (
-                    _id, created_at, label, notes,
-                    addr, sqft_r,
-                    pp, rentm,
-                    down_pct, ir, term_y, opex_r,
-                    mtax, mins, mhoa, mmaint
-                ) = deal
+                did = id_map[tag]
+                d = get_deal_by_id(did)
+                if not d:
+                    continue
 
-                metrics = compute_metrics(
-                    purchase_price=float(pp),
-                    rent_monthly=float(rentm),
-                    sqft=float(sqft_r) if sqft_r else None,
-                    down_pct=float(down_pct),
-                    interest_rate=float(ir),
-                    term_years=int(term_y),
-                    opex_ratio=float(opex_r),
-                    monthly_taxes=float(mtax),
-                    monthly_insurance=float(mins),
-                    monthly_hoa=float(mhoa),
-                    monthly_maintenance=float(mmaint),
+                # Use reasonable defaults for comparison (same as QuickCheck defaults)
+                x = Inputs(
+                    address=d.get("address", ""),
+                    sqft=float(d["sqft"]) if d.get("sqft") else None,
+                    purchase_price=float(d["purchase_price"]),
+                    rent_monthly=float(d["estimated_rent"]),
+
+                    down_pct=0.20,
+                    interest_rate=0.07,
+                    term_years=30,
+
+                    vacancy_pct=0.05,
+                    mgmt_pct=0.08,
+                    opex_pct=0.35,
+
+                    taxes_monthly=float(d.get("monthly_taxes", 0)),
+                    insurance_monthly=float(d.get("monthly_insurance", 0)),
+                    hoa_monthly=float(d.get("monthly_hoa", 0)),
+                    maintenance_monthly=float(d.get("monthly_maintenance", 0)),
+                    other_monthly=0.0,
+
+                    reserves_monthly=150.0,
+                    capex_monthly=150.0,
+
+                    closing_cost_pct=0.02,
+                    lender_points_pct=0.01,
                 )
 
-                compare_rows.append(
-                    {
-                        "Deal": f"{deal_id} • {label or 'Untitled'}",
-                        "Address": addr,
-                        "Purchase Price": float(pp),
-                        "Rent (Monthly)": float(rentm),
-                        "Monthly Cash Flow": float(metrics["cash_flow_monthly"]),
-                        "Cap Rate %": float(metrics["cap_rate"]),
-                        "CoC %": float(metrics["coc_return"]),
-                    }
-                )
+                m = underwrite(x)
 
-            st.dataframe(compare_rows, use_container_width=True)
+                compare_rows.append({
+                    "deal_id": did,
+                    "label": d.get("label",""),
+                    "address": d.get("address",""),
+                    "purchase_price": float(d["purchase_price"]),
+                    "rent_monthly": float(d["estimated_rent"]),
+                    "cash_flow_monthly": float(m["cash_flow_monthly"]),
+                    "coc_return_pct": float(m["coc_return_pct"]),
+                    "cap_rate_pct": float(m["cap_rate_pct"]),
+                    "breakeven_rent_monthly": float(m["breakeven_rent_monthly"]),
+                })
 
-            st.subheader("Monthly cash flow comparison")
-            st.bar_chart({row["Deal"]: row["Monthly Cash Flow"] for row in compare_rows})
+            out = pd.DataFrame(compare_rows)
+            st.dataframe(out, use_container_width=True)
+
+            st.subheader("Monthly Cash Flow (comparison)")
+            chart_series = out.set_index("deal_id")["cash_flow_monthly"]
+            st.bar_chart(chart_series)
