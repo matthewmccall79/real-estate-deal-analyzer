@@ -1,14 +1,21 @@
 import os
 import sqlite3
 from datetime import datetime
-import streamlit as st
 
+import streamlit as st
+import requests
+
+
+# =========================
+# CONFIG
+# =========================
+st.set_page_config(page_title="Real Estate Deal Analyzer", layout="centered")
 DB = os.path.join(os.path.dirname(__file__), "realestate.db")
 
 
-# ----------------------------
-# Finance helpers
-# ----------------------------
+# =========================
+# FINANCE HELPERS
+# =========================
 def monthly_payment(principal: float, annual_rate: float, years: int) -> float:
     if principal <= 0:
         return 0.0
@@ -22,7 +29,7 @@ def monthly_payment(principal: float, annual_rate: float, years: int) -> float:
 def compute_metrics(
     purchase_price: float,
     rent_monthly: float,
-    sqft: float,
+    sqft: float | None,
     down_pct: float,
     interest_rate: float,
     term_years: int,
@@ -48,7 +55,6 @@ def compute_metrics(
 
     cap_rate = (noi_annual / purchase_price) * 100 if purchase_price else 0.0
     coc_return = (cash_flow_annual / cash_invested) * 100 if cash_invested else 0.0
-
     price_per_sqft = (purchase_price / sqft) if sqft and sqft > 0 else None
 
     return {
@@ -65,9 +71,91 @@ def compute_metrics(
     }
 
 
-# ----------------------------
-# DB helpers
-# ----------------------------
+# =========================
+# API HELPERS
+# =========================
+def get_attom_key():
+    try:
+        return st.secrets.get("ATTOM_API_KEY", None)
+    except Exception:
+        return os.getenv("ATTOM_API_KEY")
+
+
+def nominatim_suggest(query: str, limit: int = 6):
+    """
+    Autocomplete suggestions via OpenStreetMap Nominatim.
+    Returns display_name strings.
+    """
+    q = (query or "").strip()
+    if len(q) < 4:
+        return []
+
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": q,
+        "format": "json",
+        "addressdetails": 0,
+        "limit": str(limit),
+    }
+    headers = {"User-Agent": "real-estate-deal-analyzer/1.0"}
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for item in data:
+            dn = item.get("display_name")
+            if dn:
+                out.append(dn)
+        return out
+    except Exception:
+        return []
+
+
+def attom_lookup_by_address(address_one_line: str):
+    """
+    ATTOM basic profile lookup by a single address string.
+    Returns {'address_one_line':..., 'sqft':...} or {'error':...}.
+    """
+    api_key = get_attom_key()
+    if not api_key:
+        return {"error": "Missing ATTOM_API_KEY in Streamlit Secrets."}
+
+    url = "https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/basicprofile"
+    headers = {"apikey": api_key, "Accept": "application/json"}
+    params = {"address": address_one_line}
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=12)
+        if r.status_code != 200:
+            return {"error": f"ATTOM returned {r.status_code}: {r.text[:200]}"}
+
+        data = r.json()
+
+        props = data.get("property")
+        p = props[0] if isinstance(props, list) and props else (props if isinstance(props, dict) else None)
+        if not p:
+            return {"error": "No property found for that address."}
+
+        addr = p.get("address", {}) or {}
+        building = p.get("building", {}) or {}
+        size = (building.get("size") or {}) if isinstance(building, dict) else {}
+
+        sqft = size.get("livingsize") or size.get("bldgsize") or size.get("grosssize")
+        one_line = addr.get("oneLine") or address_one_line
+
+        return {
+            "address_one_line": one_line,
+            "sqft": float(sqft) if sqft is not None else None,
+        }
+    except Exception as e:
+        return {"error": f"ATTOM lookup failed: {e}"}
+
+
+# =========================
+# DB HELPERS
+# =========================
 def get_conn():
     return sqlite3.connect(DB, check_same_thread=False)
 
@@ -184,8 +272,9 @@ def delete_saved_deal(deal_id: int):
 
 def load_latest_deal_from_existing_tables():
     """
-    This keeps your existing pipeline working:
-    it grabs the most recent deal in deal_inputs joined to property_facts.
+    Pulls your latest ingested deal from existing tables:
+    deal_inputs JOIN property_facts.
+    Used as sensible defaults.
     """
     conn = get_conn()
     cur = conn.cursor()
@@ -210,12 +299,11 @@ def load_latest_deal_from_existing_tables():
     return row
 
 
-# ----------------------------
-# UI
-# ----------------------------
-st.set_page_config(page_title="Real Estate Deal Analyzer", layout="centered")
+# =========================
+# APP UI
+# =========================
 st.title("🏠 Real Estate Deal Analyzer")
-st.caption("Backend-driven underwriting tool (Python, SQL, API data)")
+st.caption("Paste an address → autocomplete → lookup sqft → underwrite → save → compare")
 
 create_saved_deals_table()
 
@@ -224,33 +312,61 @@ tab1, tab2, tab3 = tabs
 
 latest = load_latest_deal_from_existing_tables()
 if not latest:
-    st.error("No deal data found in your database yet. Run your extract/save step first.")
+    st.error("No deal data found in your database yet. Run your extract/save pipeline first.")
     st.stop()
 
-address, sqft, price, rent, tax, ins, hoa, maint = latest
-sqft = float(sqft) if sqft is not None else None
+db_address, db_sqft, db_price, db_rent, db_tax, db_ins, db_hoa, db_maint = latest
+db_sqft = float(db_sqft) if db_sqft is not None else None
+
 
 # ==========================================================
-# TAB 1 — QUICKCHECK + SAVE
+# TAB 1 — QUICKCHECK + LOOKUP + SAVE
 # ==========================================================
 with tab1:
-    st.subheader("1) Property")
+    st.subheader("1) Property (Address Search + Lookup)")
 
-    override_address = st.text_input("Property address (optional override)", value=address)
-    display_address = override_address.strip() if override_address.strip() else address
+    if "lookup_result" not in st.session_state:
+        st.session_state["lookup_result"] = {}
 
-    st.write(display_address)
-    st.write(f"Square Feet: {sqft if sqft is not None else 'Unknown'}")
+    search_q = st.text_input("Search address", value=db_address)
+    suggestions = nominatim_suggest(search_q)
+    picked = st.selectbox("Suggestions (optional)", ["(use typed address)"] + suggestions)
 
-    st.subheader("2) Financing & operating assumptions")
+    lookup_address = search_q if picked == "(use typed address)" else picked
+
+    colL, colR = st.columns([1, 2])
+    with colL:
+        do_lookup = st.button("🔎 Lookup (auto-fill sqft)")
+    with colR:
+        st.caption("Uses ATTOM to auto-fill sqft when possible. You can still override manually.")
+
+    if do_lookup:
+        res = attom_lookup_by_address(lookup_address)
+        st.session_state["lookup_result"] = res
+        if res.get("error"):
+            st.error(res["error"])
+        else:
+            st.success("Lookup success — sqft will be pre-filled below.")
+
+    lookup = st.session_state.get("lookup_result", {}) or {}
+    display_address = lookup.get("address_one_line") or lookup_address
+
+    sqft_default = lookup.get("sqft")
+    if sqft_default is None:
+        sqft_default = db_sqft if db_sqft is not None else 0.0
+
+    st.write(f"**Using address:** {display_address}")
+    st.write(f"**Sqft default:** {sqft_default if sqft_default else 'Unknown'}")
+
+    st.subheader("2) Underwrite (Adjust Inputs)")
 
     with st.form("quickcheck_form"):
         col1, col2 = st.columns(2)
 
         with col1:
-            purchase_price = st.number_input("Purchase price ($)", min_value=0.0, value=float(price))
-            rent_monthly = st.number_input("Estimated rent (monthly $)", min_value=0.0, value=float(rent))
-            sqft_input = st.number_input("Sqft (optional)", min_value=0.0, value=float(sqft or 0.0))
+            purchase_price = st.number_input("Purchase price ($)", min_value=0.0, value=float(db_price))
+            rent_monthly = st.number_input("Estimated rent (monthly $)", min_value=0.0, value=float(db_rent))
+            sqft_input = st.number_input("Sqft (optional override)", min_value=0.0, value=float(sqft_default or 0.0))
 
             down_pct = st.slider("Down payment (%)", 5, 40, 20) / 100
             interest_rate = st.slider("Interest rate (%)", 3.0, 10.0, 7.0) / 100
@@ -261,33 +377,33 @@ with tab1:
 
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                monthly_taxes = st.number_input("Taxes ($/mo)", min_value=0.0, value=float(tax))
+                monthly_taxes = st.number_input("Taxes ($/mo)", min_value=0.0, value=float(db_tax))
             with c2:
-                monthly_insurance = st.number_input("Insurance ($/mo)", min_value=0.0, value=float(ins))
+                monthly_insurance = st.number_input("Insurance ($/mo)", min_value=0.0, value=float(db_ins))
             with c3:
-                monthly_hoa = st.number_input("HOA ($/mo)", min_value=0.0, value=float(hoa))
+                monthly_hoa = st.number_input("HOA ($/mo)", min_value=0.0, value=float(db_hoa))
             with c4:
-                monthly_maintenance = st.number_input("Maintenance ($/mo)", min_value=0.0, value=float(maint))
+                monthly_maintenance = st.number_input("Maintenance ($/mo)", min_value=0.0, value=float(db_maint))
 
             label = st.text_input("Label (optional)", value="")
             notes = st.text_area("Notes (optional)", value="", height=90)
 
-        submitted = st.form_submit_button("Run QuickCheck")
+        run_clicked = st.form_submit_button("Run QuickCheck")
         save_clicked = st.form_submit_button("Run QuickCheck + Save")
 
-    if submitted or save_clicked:
+    if run_clicked or save_clicked:
         metrics = compute_metrics(
-            purchase_price=purchase_price,
-            rent_monthly=rent_monthly,
-            sqft=sqft_input if sqft_input > 0 else None,
-            down_pct=down_pct,
-            interest_rate=interest_rate,
-            term_years=term_years,
-            opex_ratio=opex_ratio,
-            monthly_taxes=monthly_taxes,
-            monthly_insurance=monthly_insurance,
-            monthly_hoa=monthly_hoa,
-            monthly_maintenance=monthly_maintenance,
+            purchase_price=float(purchase_price),
+            rent_monthly=float(rent_monthly),
+            sqft=float(sqft_input) if sqft_input and sqft_input > 0 else None,
+            down_pct=float(down_pct),
+            interest_rate=float(interest_rate),
+            term_years=int(term_years),
+            opex_ratio=float(opex_ratio),
+            monthly_taxes=float(monthly_taxes),
+            monthly_insurance=float(monthly_insurance),
+            monthly_hoa=float(monthly_hoa),
+            monthly_maintenance=float(monthly_maintenance),
         )
 
         st.subheader("3) Results")
@@ -299,17 +415,14 @@ with tab1:
         a2, b2, c2 = st.columns(3)
         a2.metric("Mortgage P&I (Monthly)", f"${metrics['mortgage_pmt']:,.2f}")
         b2.metric("NOI (Annual)", f"${metrics['noi_annual']:,.2f}")
-        if metrics["price_per_sqft"] is not None:
-            c2.metric("Price / Sqft", f"${metrics['price_per_sqft']:,.2f}")
-        else:
-            c2.metric("Price / Sqft", "—")
+        c2.metric("Price / Sqft", f"${metrics['price_per_sqft']:,.2f}" if metrics["price_per_sqft"] else "—")
 
         if save_clicked:
             insert_saved_deal(
                 {
                     "created_at": datetime.utcnow().isoformat(),
-                    "label": label.strip() or None,
-                    "notes": notes.strip() or None,
+                    "label": (label.strip() or None),
+                    "notes": (notes.strip() or None),
                     "address": display_address,
                     "sqft": float(sqft_input) if sqft_input and sqft_input > 0 else None,
                     "purchase_price": float(purchase_price),
@@ -337,7 +450,6 @@ with tab2:
     if not rows:
         st.info("No saved deals yet. Use QuickCheck + Save to add one.")
     else:
-        # Make a friendly select list
         options = {}
         for (deal_id, created_at, label, addr, sqft_r, pp, rentm) in rows:
             tag = f"{deal_id} • {label or 'Untitled'} • {addr} • ${pp:,.0f} • ${rentm:,.0f}/mo"
@@ -380,12 +492,10 @@ with tab2:
         b.metric("Cash-on-Cash Return", f"{metrics['coc_return']:.2f}%")
         c.metric("Cap Rate", f"{metrics['cap_rate']:.2f}%")
 
-        colL, colR = st.columns([1, 1])
-        with colL:
-            if st.button("🗑️ Delete this saved deal"):
-                delete_saved_deal(selected_id)
-                st.success("Deleted. Refreshing…")
-                st.rerun()
+        if st.button("🗑️ Delete this saved deal"):
+            delete_saved_deal(selected_id)
+            st.success("Deleted. Refreshing…")
+            st.rerun()
 
 
 # ==========================================================
@@ -398,7 +508,6 @@ with tab3:
     if len(rows) < 2:
         st.info("Save at least 2 deals to compare them.")
     else:
-        # Multi-select compare list
         items = []
         id_by_label = {}
         for (deal_id, created_at, label, addr, sqft_r, pp, rentm) in rows:
@@ -449,7 +558,5 @@ with tab3:
 
             st.dataframe(compare_rows, use_container_width=True)
 
-            st.subheader("Quick visual")
-            st.bar_chart(
-                {row["Deal"]: row["Monthly Cash Flow"] for row in compare_rows}
-            )
+            st.subheader("Monthly cash flow comparison")
+            st.bar_chart({row["Deal"]: row["Monthly Cash Flow"] for row in compare_rows})
