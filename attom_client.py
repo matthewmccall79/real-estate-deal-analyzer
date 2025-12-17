@@ -1,48 +1,75 @@
 import os
 import requests
-
+import streamlit as st
 
 ATTOM_BASE_URL = "https://api.gateway.attomdata.com/propertyapi/v1.0.0"
 
 
-def get_attom_headers():
+def _get_attom_api_key() -> str:
     """
-    Reads ATTOM API key from environment variables.
+    Streamlit Cloud: use st.secrets
+    Local dev: allow environment variable fallback
     """
-    api_key = os.getenv("ATTOM_API_KEY")
-    if not api_key:
-        raise RuntimeError("ATTOM_API_KEY not found in environment variables")
-    return {
-        "Accept": "application/json",
-        "apikey": api_key,
-    }
+    key = None
 
+    # Streamlit secrets (works on Streamlit Cloud)
+    try:
+        key = st.secrets.get("ATTOM_API_KEY")
+    except Exception:
+        key = None
 
-def lookup_property_by_address(address):
-    """
-    Look up property facts using a full address string.
-    Returns parsed JSON or None if not found.
-    """
-    url = f"{ATTOM_BASE_URL}/property/basicprofile"
-    params = {
-        "address": address
-    }
+    # Fallback to env var (works locally)
+    if not key:
+        key = os.getenv("ATTOM_API_KEY")
 
-    response = requests.get(
-        url,
-        headers=get_attom_headers(),
-        params=params,
-        timeout=10,
-    )
-
-    if response.status_code != 200:
+    if not key:
         raise RuntimeError(
-            f"ATTOM API error {response.status_code}: {response.text}"
+            "ATTOM_API_KEY not found. Add it in Streamlit Cloud: Manage app → Settings → Secrets "
+            "as: ATTOM_API_KEY = \"your_key\" (or set it as an environment variable locally)."
         )
 
-    data = response.json()
+    return key
 
-    if not data or "property" not in data or not data["property"]:
-        return None
 
-    return data["property"][0]
+def get_attom_headers() -> dict:
+    return {
+        "Accept": "application/json",
+        "apikey": _get_attom_api_key(),
+    }
+
+
+def lookup_property_by_address(address: str) -> dict:
+    """
+    Look up property facts using a full address string.
+    Returns parsed JSON dict on success.
+    Raises RuntimeError with a helpful message on failure.
+    """
+    address = (address or "").strip()
+    if not address:
+        raise RuntimeError("Address is blank.")
+
+    url = f"{ATTOM_BASE_URL}/property/basicprofile"
+    params = {"address": address}
+
+    try:
+        resp = requests.get(url, headers=get_attom_headers(), params=params, timeout=20)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Network error calling ATTOM: {e}")
+
+    # Helpful errors
+    if resp.status_code in (401, 403):
+        raise RuntimeError(
+            f"ATTOM returned {resp.status_code} (auth/permission). "
+            "Double-check your API key in Streamlit Secrets."
+        )
+    if resp.status_code == 429:
+        raise RuntimeError("ATTOM rate limit hit (429). Try again in a minute.")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"ATTOM returned {resp.status_code}: {resp.text[:200]}")
+
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError("ATTOM response was not valid JSON.")
+
+    return data
